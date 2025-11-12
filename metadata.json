@@ -1,0 +1,8 @@
+{
+  "name": "Employee Management System",
+  "description": "A comprehensive, AI-enhanced Employee Management System designed to streamline HR operations, including employee data management, attendance, payroll, performance reviews, and leave tracking. Built with a modern, intuitive interface for HR managers, department heads, and employees.",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ]
+}
