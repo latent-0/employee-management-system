@@ -51,14 +51,14 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         // Pre-authentication check for terminated employees
         const { data: profile } = await supabase
             .from('employees')
-            .select('scheduledDeletionDate, terminationReason')
+            .select('scheduled_deletion_date, termination_reason')
             .eq('email', credentials.email)
             .single();
 
-        if (profile?.scheduledDeletionDate) {
+        if (profile?.scheduled_deletion_date) {
             const termError: any = new Error('This account is scheduled for deletion.');
             termError.isTermination = true;
-            termError.details = { reason: profile.terminationReason, date: profile.scheduledDeletionDate };
+            termError.details = { reason: profile.termination_reason, date: profile.scheduled_deletion_date };
             throw termError;
         }
 
@@ -73,16 +73,24 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     };
 
     const signUpAdmin = async (data: any) => {
-        // 1. Create the company
-        const { data: companyData, error: companyError } = await supabase
+        // Pre-flight check to prevent race condition with the 'PENDING' invitation code.
+        const { data: pendingCompany, error: checkError } = await supabase
             .from('companies')
-            .insert({ name: data.companyName, invitationCode: 'PENDING' })
-            .select()
+            .select('id')
+            .eq('invitation_code', 'PENDING')
+            .limit(1)
             .single();
 
-        if (companyError) throw companyError;
+        // Let PGRST116 (No rows found) pass, but throw other errors.
+        if (checkError && checkError.code !== 'PGRST116') {
+            throw new Error(`Database check failed: ${checkError.message}`);
+        }
 
-        // 2. Sign up the user
+        if (pendingCompany) {
+            throw new Error("An administrator sign-up is already in progress. Please wait a few moments and try again.");
+        }
+        
+        // 1. Sign up the user. The session might be null if email confirmation is on.
         const { data: authData, error: authError } = await supabase.auth.signUp({
             email: data.email,
             password: data.password,
@@ -90,41 +98,74 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
                 data: {
                     name: data.name,
                     role: UserRoleEnum.ADMIN,
-                    companyId: companyData.id,
-                    avatarUrl: data.avatarUrl, // Use captured photo
+                    avatarUrl: data.avatarUrl,
                 }
             }
         });
 
-        if (authError) throw authError;
-
-        // 3. Create the employee profile
-        if (authData.user) {
-            const { error: profileError } = await supabase.from('employees').insert({
-                id: authData.user.id,
-                name: data.name,
-                email: data.email,
-                role: UserRoleEnum.ADMIN,
-                companyId: companyData.id,
-                avatarUrl: data.avatarUrl, // Use captured photo
-                onboardingCompleted: false,
-                department: 'Management',
-                jobTitle: 'Administrator',
-                dateOfJoining: new Date().toISOString().split('T')[0],
-                phone: '',
-            });
-
-            if (profileError) throw profileError;
+        if (authError || !authData.user) {
+            throw authError || new Error('User could not be created.');
         }
-        // onAuthStateChange will handle setting the user state
+
+        // 2. Call the database function to create the company and employee profile.
+        // This function runs with elevated privileges (SECURITY DEFINER) to bypass RLS
+        // that would otherwise block the new, unconfirmed user.
+        const { data: companyId, error: rpcError } = await supabase.rpc('create_company_and_admin', {
+            company_name: data.companyName,
+            admin_id: authData.user.id,
+            admin_name: data.name,
+            admin_email: data.email,
+            admin_avatar_url: data.avatarUrl
+        });
+
+        if (rpcError || !companyId) {
+            console.error("Failed to create company and admin profile via RPC. Full error object:", rpcError);
+            
+            // Construct a detailed, user-friendly error message.
+            let userMessage = "An error occurred while creating the company profile.";
+            if (rpcError) {
+                // Use the message from Supabase if available, as it's often informative.
+                if (rpcError.message) {
+                    userMessage = `Error: ${rpcError.message}`;
+                    // Append details if they exist for more context.
+                    if (rpcError.details) {
+                        userMessage += ` (${rpcError.details})`;
+                    }
+                } else {
+                    // Fallback for unexpected error structures, preventing '[object Object]'.
+                    userMessage = `A database error occurred. Please check the console for the full error object.`;
+                }
+            }
+            
+            throw new Error(userMessage);
+        }
+
+        // 3. Log the user in to start their session immediately.
+        const { error: signInError } = await supabase.auth.signInWithPassword({
+            email: data.email,
+            password: data.password,
+        });
+
+        if (signInError) {
+            // If sign-in fails, it might be due to email confirmation being required.
+            // We'll throw an error that suggests this.
+            console.error("Sign-in after admin sign-up failed:", signInError);
+            throw new Error(
+                "Company created, but auto-login failed. Please check your email to verify your account, then log in manually."
+            );
+        }
+
+        // After successful sign-in, the onAuthStateChange listener will fire,
+        // fetch the user profile, and update the application state,
+        // automatically redirecting the user to the admin onboarding flow.
     };
 
     const signUpEmployee = async (data: any) => {
-        // 1. Find the company by invitation code
+        // 1. Find the company by invitation code. This is an anonymous query and is fine.
         const { data: companyData, error: companyError } = await supabase
             .from('companies')
             .select('id')
-            .eq('invitationCode', data.invitationCode)
+            .eq('invitation_code', data.invitationCode)
             .single();
         
         if (companyError || !companyData) throw new Error("Invalid invitation code.");
@@ -138,30 +179,45 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
                     name: data.name,
                     role: UserRoleEnum.EMPLOYEE,
                     companyId: companyData.id,
-                    avatarUrl: data.avatarUrl, // Use captured photo
+                    avatarUrl: data.avatarUrl,
                 }
             }
         });
 
-        if (authError) throw authError;
+        if (authError || !authData.user) {
+            throw authError || new Error('User could not be created.');
+        }
 
-        // 3. Create employee profile
-         if (authData.user) {
-            const { error: profileError } = await supabase.from('employees').insert({
-                id: authData.user.id,
-                name: data.name,
-                email: data.email,
-                role: UserRoleEnum.EMPLOYEE,
-                companyId: companyData.id,
-                avatarUrl: data.avatarUrl, // Use captured photo
-                onboardingCompleted: false,
-                department: 'Unassigned',
-                jobTitle: 'Employee',
-                dateOfJoining: new Date().toISOString().split('T')[0],
-                phone: data.phone,
-            });
+        // 3. Create employee profile using an RPC call to a SECURITY DEFINER function
+        const { error: rpcError } = await supabase.rpc('create_employee_profile', {
+            employee_id: authData.user.id,
+            company_id: companyData.id,
+            employee_name: data.name,
+            employee_email: data.email,
+            employee_avatar_url: data.avatarUrl,
+            employee_phone: data.phone
+        });
 
-            if (profileError) throw profileError;
+        if (rpcError) {
+            console.error("Failed to create employee profile via RPC. Full error object:", rpcError);
+            
+            // Construct a detailed, user-friendly error message.
+            let userMessage = "An error occurred while creating the employee profile.";
+             if (rpcError) {
+                // Use the message from Supabase if available, as it's often informative.
+                if (rpcError.message) {
+                    userMessage = `Error: ${rpcError.message}`;
+                    // Append details if they exist for more context.
+                    if (rpcError.details) {
+                        userMessage += ` (${rpcError.details})`;
+                    }
+                } else {
+                    // Fallback for unexpected error structures, preventing '[object Object]'.
+                    userMessage = `A database error occurred. Please check the console for the full error object.`;
+                }
+            }
+
+            throw new Error(userMessage);
         }
     };
     

@@ -9,6 +9,21 @@ import type {
 } from "../types";
 import { AttendanceStatus, LeaveStatus } from "../types";
 
+// Helper to convert object keys to snake_case for Supabase
+const camelToSnakeCase = (str: string) => str.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
+const keysToSnakeCase = (obj: any): any => {
+    if (Array.isArray(obj)) {
+        return obj.map(v => keysToSnakeCase(v));
+    } else if (obj !== null && obj.constructor === Object) {
+        return Object.keys(obj).reduce((acc, key) => {
+            acc[camelToSnakeCase(key)] = keysToSnakeCase(obj[key]);
+            return acc;
+        }, {} as any);
+    }
+    return obj;
+};
+
+
 // Helper function to handle Supabase errors
 const handleSupabaseError = (error: any, context: string) => {
     if (error) {
@@ -25,7 +40,7 @@ export const api = {
         return data;
     },
     async updateCompanyDetails(id: string, updates: Partial<Company>): Promise<Company> {
-        const { data, error } = await supabase.from('companies').update(updates).eq('id', id).select().single();
+        const { data, error } = await supabase.from('companies').update(keysToSnakeCase(updates)).eq('id', id).select().single();
         handleSupabaseError(error, 'updateCompanyDetails');
         return data!;
     },
@@ -45,7 +60,7 @@ export const api = {
         return data;
     },
     async updateEmployeeProfile(id: string, updates: Partial<Employee>): Promise<Employee> {
-        const { data, error } = await supabase.from('employees').update(updates).eq('id', id).select().single();
+        const { data, error } = await supabase.from('employees').update(keysToSnakeCase(updates)).eq('id', id).select().single();
         handleSupabaseError(error, 'updateEmployeeProfile');
         return data!;
     },
@@ -54,20 +69,20 @@ export const api = {
         deletionDate.setDate(deletionDate.getDate() + 10);
         
         const { error } = await supabase.from('employees').update({
-            scheduledDeletionDate: deletionDate.toISOString(),
-            terminationReason: reason
+            scheduled_deletion_date: deletionDate.toISOString(),
+            termination_reason: reason
         }).eq('id', id);
 
         handleSupabaseError(error, 'removeEmployee');
     },
     async completeOnboarding(id: string): Promise<void> {
-       const { error } = await supabase.from('employees').update({ onboardingCompleted: true }).eq('id', id);
+       const { error } = await supabase.from('employees').update({ onboarding_completed: true }).eq('id', id);
        handleSupabaseError(error, 'completeOnboarding');
     },
 
     // Attendance
     async getAttendanceForEmployee(employeeId: string): Promise<Attendance[]> {
-        const { data, error } = await supabase.from('attendance').select('*').eq('employeeId', employeeId);
+        const { data, error } = await supabase.from('attendance').select('*').eq('employee_id', employeeId);
         handleSupabaseError(error, 'getAttendanceForEmployee');
         return data || [];
     },
@@ -75,19 +90,22 @@ export const api = {
         const { data: existing, error: findError } = await supabase
             .from('attendance')
             .select('*')
-            .eq('employeeId', employeeId)
+            .eq('employee_id', employeeId)
             .eq('date', date)
             .single();
 
-        handleSupabaseError(findError, 'markAttendance (find)');
+        // Allow findError to be null or not found, but throw other errors
+        if (findError && findError.code !== 'PGRST116') {
+            handleSupabaseError(findError, 'markAttendance (find)');
+        }
 
         const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
         if (existing) { // Clocking out
-            if (existing.checkOutTime) throw new Error("Already clocked out for today.");
+            if (existing.check_out_time) throw new Error("Already clocked out for today.");
             const { data, error } = await supabase
                 .from('attendance')
-                .update({ checkOutTime: timeStr })
+                .update({ check_out_time: timeStr })
                 .eq('id', existing.id)
                 .select()
                 .single();
@@ -97,10 +115,10 @@ export const api = {
              const { data, error } = await supabase
                 .from('attendance')
                 .insert({
-                    employeeId,
+                    employee_id: employeeId,
                     date,
                     status: AttendanceStatus.PRESENT,
-                    checkInTime: timeStr,
+                    check_in_time: timeStr,
                 })
                 .select()
                 .single();
@@ -111,19 +129,19 @@ export const api = {
 
     // Leave
     async getLeaveRequestsForEmployee(employeeId: string): Promise<LeaveRequest[]> {
-        const { data, error } = await supabase.from('leave_requests').select('*').eq('employeeId', employeeId);
+        const { data, error } = await supabase.from('leave_requests').select('*').eq('employee_id', employeeId);
         handleSupabaseError(error, 'getLeaveRequestsForEmployee');
         return data || [];
     },
     async getLeaveRequestsForManager(managerId: string): Promise<LeaveRequest[]> {
-        const { data, error } = await supabase.from('leave_requests').select('*').eq('approverId', managerId);
+        const { data, error } = await supabase.from('leave_requests').select('*').eq('approver_id', managerId);
         handleSupabaseError(error, 'getLeaveRequestsForManager');
         return data || [];
     },
     async submitLeaveRequest(requestData: Omit<LeaveRequest, 'id' | 'status'>): Promise<LeaveRequest> {
         const { data, error } = await supabase
             .from('leave_requests')
-            .insert({ ...requestData, status: LeaveStatus.PENDING })
+            .insert(keysToSnakeCase({ ...requestData, status: LeaveStatus.PENDING }))
             .select()
             .single();
         handleSupabaseError(error, 'submitLeaveRequest');
@@ -142,7 +160,7 @@ export const api = {
 
     // Payroll
     async getPayrollsForEmployee(employeeId: string): Promise<Payroll[]> {
-        const { data, error } = await supabase.from('payrolls').select('*').eq('employeeId', employeeId);
+        const { data, error } = await supabase.from('payrolls').select('*').eq('employee_id', employeeId);
         handleSupabaseError(error, 'getPayrollsForEmployee');
         return data || [];
     },
@@ -154,13 +172,13 @@ export const api = {
         if (!employees) return [];
         
         const newPayrollsData = employees.map(emp => ({
-            employeeId: emp.id,
+            employee_id: emp.id,
             month,
             year,
-            basicSalary: 5000,
+            basic_salary: 5000,
             deductions: 500,
-            netSalary: 4500,
-            generatedDate: new Date().toISOString(),
+            net_salary: 4500,
+            generated_date: new Date().toISOString(),
         }));
 
         const { data, error } = await supabase.from('payrolls').insert(newPayrollsData).select();
@@ -170,7 +188,7 @@ export const api = {
     
     // Performance
     async getPerformanceReviewsForEmployee(employeeId: string): Promise<PerformanceReview[]> {
-        const { data, error } = await supabase.from('performance_reviews').select('*').eq('employeeId', employeeId);
+        const { data, error } = await supabase.from('performance_reviews').select('*').eq('employee_id', employeeId);
         handleSupabaseError(error, 'getPerformanceReviewsForEmployee');
         return data || [];
     },
@@ -180,7 +198,7 @@ export const api = {
         return data || [];
     },
     async submitPerformanceReview(reviewData: Omit<PerformanceReview, 'id'>): Promise<PerformanceReview> {
-       const { data, error } = await supabase.from('performance_reviews').insert(reviewData).select().single();
+       const { data, error } = await supabase.from('performance_reviews').insert(keysToSnakeCase(reviewData)).select().single();
        handleSupabaseError(error, 'submitPerformanceReview');
        return data!;
     },
